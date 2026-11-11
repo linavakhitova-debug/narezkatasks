@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Нарезка задач из чек-листа</title>
+    <script src="//://bitrix24.com"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; color: #333; }
+        .status { margin-top: 15px; font-size: 15px; font-weight: 500; }
+        .error { color: #d93025; }
+        .success { color: #188038; }
+    </style>
+</head>
+<body>
+    <h3>Нарезка задач из чек-листа</h3>
+    <div id="status" class="status">Инициализация...</div>
+
+    <script>
+        BX24.init(function() {
+            const placementInfo = BX24.placement.info();
+            const statusEl = document.getElementById('status');
+
+            // Первичная установка кнопки при открытии из меню приложений
+            if (placementInfo.placement === 'DEFAULT') {
+                const handlerUrl = window.location.href.split('?')[0];
+                BX24.callMethod('placement.bind', {
+                    PLACEMENT: 'TASK_VIEW_TOP_PANEL',
+                    HANDLER: handlerUrl,
+                    TITLE: 'Нарезать из чек-листа'
+                }, function(res) {
+                    if (res.error()) {
+                        statusEl.className = 'status error';
+                        statusEl.innerText = 'Ошибка установки кнопки: ' + res.error();
+                    } else {
+                        statusEl.className = 'status success';
+                        statusEl.innerText = 'Кнопка «Нарезать из чек-листа» успешно добавлена в задачи!';
+                    }
+                });
+                return;
+            }
+
+            // Запуск внутри задачи
+            const taskId = placementInfo.options.TASK_ID;
+            statusEl.innerText = 'Получаем данные задачи...';
+
+            BX24.callMethod('tasks.task.get', { taskId: taskId }, function(res) {
+                if (res.error()) {
+                    statusEl.className = 'status error';
+                    statusEl.innerText = 'Ошибка получения задачи: ' + res.error();
+                    return;
+                }
+                const parentTask = res.data().task;
+
+                statusEl.innerText = 'Читаем чек-лист...';
+                BX24.callMethod('task.checklistitem.getlist', [taskId], function(clRes) {
+                    if (clRes.error()) {
+                        statusEl.className = 'status error';
+                        statusEl.innerText = 'Ошибка чтения чек-листа: ' + clRes.error();
+                        return;
+                    }
+
+                    const items = clRes.data();
+                    // Фильтруем только активные пункты (убираем заголовки чек-листов с PARENT_ID === '0')
+                    const tasksToCreate = items.filter(item => item.IS_COMPLETE === 'N' && String(item.PARENT_ID) !== '0');
+
+                    if (tasksToCreate.length === 0) {
+                        statusEl.className = 'status error';
+                        statusEl.innerText = 'Нет невыполненных пунктов в чек-листе для нарезки.';
+                        return;
+                    }
+
+                    statusEl.innerText = `Создаем подзадачи (${tasksToCreate.length} шт.)...`;
+
+                    // 1. Формируем пакетный запрос на создание подзадач
+                    let createBatch = {};
+                    tasksToCreate.forEach((item, index) => {
+                        let responsibleId = parentTask.responsibleId;
+                        let accomplices = [];
+                        let auditors = [];
+
+                        if (Array.isArray(item.MEMBERS) && item.MEMBERS.length > 0) {
+                            const itemExecutors = item.MEMBERS.filter(m => m.TYPE === 'A').map(m => m.ID);
+                            const itemAuditors = item.MEMBERS.filter(m => m.TYPE === 'U').map(m => m.ID);
+
+                            if (itemExecutors.length > 0) {
+                                responsibleId = itemExecutors[0];
+                                if (itemExecutors.length > 1) {
+                                    accomplices = itemExecutors.slice(1);
+                                }
+                            }
+                            if (itemAuditors.length > 0) {
+                                auditors = itemAuditors;
+                            }
+                        }
+
+                        createBatch['create_' + index] = [
+                            'tasks.task.add',
+                            {
+                                fields: {
+                                    TITLE: item.TITLE,
+                                    PARENT_ID: taskId,
+                                    RESPONSIBLE_ID: responsibleId,
+                                    ACCOMPLICES: accomplices,
+                                    AUDITORS: auditors,
+                                    CREATED_BY: parentTask.createdBy,
+                                    GROUP_ID: parentTask.groupId || 0,
+                                    DEADLINE: parentTask.deadline || ''
+                                }
+                            }
+                        ];
+                    });
+
+                    // 2. Выполняем создание подзадач
+                    BX24.callBatch(createBatch, function(createRes) {
+                        let deleteBatch = {};
+                        let createdCount = 0;
+
+                        tasksToCreate.forEach((item, index) => {
+                            // Удаляем пункт только если подзадача по нему успешно создалась
+                            if (createRes['create_' + index] && !createRes['create_' + index].error()) {
+                                createdCount++;
+                                deleteBatch['del_' + index] = [
+                                    'task.checklistitem.delete',
+                                    [taskId, item.ID]
+                                ];
+                            }
+                        });
+
+                        if (createdCount === 0) {
+                            statusEl.className = 'status error';
+                            statusEl.innerText = 'Не удалось создать подзадачи. Пункты чек-листа сохранены.';
+                            return;
+                        }
+
+                        statusEl.innerText = `Создано подзадач: ${createdCount}. Очищаем чек-лист...`;
+
+                        // 3. Удаляем обработанные пункты чек-листа
+                        BX24.callBatch(deleteBatch, function() {
+                            statusEl.className = 'status success';
+                            statusEl.innerText = `Готово! Создано подзадач: ${createdCount}, пункты удалены.`;
+                            setTimeout(() => {
+                                BX24.closeApplication();
+                            }, 1200);
+                        });
+                    });
+                });
+            });
+        });
+    </script>
+</body>
+</html>
